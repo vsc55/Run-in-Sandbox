@@ -1,0 +1,95 @@
+<#
+Installs a trusted CA certificate at sandbox startup.
+
+Behavior:
+    1) `C:\Run_in_Sandbox\Certs\*.cer|*.crt|*.pem`
+    2) loose certificate files in the same `startup-scripts` directory (*.cer|*.crt|*.pem)
+
+Exit codes:
+ - 0 = success
+ - !=0 = failure
+
+Note: The script does not search or use the host Desktop or other paths beyond those listed.
+#>
+# This script also documents the download behavior when a certificate is fetched from the CA_URL.
+# When a download occurs the certificate is saved to a temporary file and the script prints a progress message:
+#   "[00-install-ca] Downloaded to: <temp path>"
+
+Write-Host "[00-install-ca] Starting: searching for CA certificate..."
+
+function Get-FirstCertFile {
+    param([string[]]$paths)
+    foreach ($p in $paths) {
+        try {
+            $files = Get-ChildItem -LiteralPath $p -File -ErrorAction SilentlyContinue
+            if ($files -and $files.Count -gt 0) { return $files[0].FullName }
+        } catch {}
+    }
+    return $null
+}
+
+# Prefer the sandbox absolute path: C:\Run_in_Sandbox\Certs
+$runSandboxCerts = 'C:\Run_in_Sandbox\Certs'
+$candidates = @(
+    (Join-Path $runSandboxCerts '*.cer'),
+    (Join-Path $runSandboxCerts '*.crt'),
+    (Join-Path $runSandboxCerts '*.pem')
+)
+
+$certPath = Get-FirstCertFile -paths $candidates
+
+if (-not $certPath -and $env:CA_URL) {
+    Write-Host "[00-install-ca] No local certificate found. Attempting to download from CA_URL..."
+    try {
+        $tmp = Join-Path $env:TEMP "sandbox_ca_$(Get-Random).cer"
+        Invoke-WebRequest -Uri $env:CA_URL -OutFile $tmp -UseBasicParsing -ErrorAction Stop
+        $certPath = $tmp
+        Write-Host "[00-install-ca] Downloaded to: $certPath"
+    } catch {
+        Write-Warning "[00-install-ca] Download from CA_URL failed: $($_.Exception.Message)"
+    }
+}
+
+if (-not $certPath) {
+    Write-Warning "[00-install-ca] No certificate found in known locations. Skipping installation."
+    exit 0
+}
+
+Write-Host "[00-install-ca] Found certificate: $certPath"
+
+function Install-Cert-With-ImportCertificate {
+    param([string]$path)
+    try {
+        Write-Host "[00-install-ca] Attempting install with Import-Certificate..."
+        Import-Certificate -FilePath $path -CertStoreLocation Cert:\LocalMachine\Root -ErrorAction Stop | Out-Null
+        Write-Host "[00-install-ca] Certificate installed to 'Trusted Root Certification Authorities' (LocalMachine)."
+        return $true
+    } catch {
+        Write-Warning "[00-install-ca] Import-Certificate failed: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+function Install-Cert-With-CertUtil {
+    param([string]$path)
+    try {
+        Write-Host "[00-install-ca] Attempting install with certutil..."
+        $args = @('-addstore','-f','Root',"$path")
+        $p = Start-Process -FilePath certutil -ArgumentList $args -NoNewWindow -Wait -PassThru -ErrorAction Stop
+        if ($p.ExitCode -eq 0) {
+            Write-Host "[00-install-ca] Certificate installed with certutil."
+            return $true
+        } else {
+            Write-Warning "[00-install-ca] certutil returned exit code $($p.ExitCode)"
+            return $false
+        }
+    } catch {
+        Write-Warning "[00-install-ca] certutil failed: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+$ok = Install-Cert-With-ImportCertificate -path $certPath
+if (-not $ok) { $ok = Install-Cert-With-CertUtil -path $certPath }
+
+if ($ok) { exit 0 } else { Write-Warning "[00-install-ca] Could not install the certificate."; exit 1 }
